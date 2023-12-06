@@ -12,10 +12,7 @@ int main(){
     cin.tie(0);
     ll n;
     cin>>n;
-  
-    // Given n < 2.10^5 so n(n+1) is within long long int
-    // The idea used below is self explanatory so skipping the explanation
-    ll sum = (n*(n+1))/2;
+    ll sum = (n*(n+1))/2; // Given n < 2.10^5 so n(n+1) is within long long int
     ll a;
     fu(i,0,n-1){
         cin>>a;
