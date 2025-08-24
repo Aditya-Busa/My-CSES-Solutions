@@ -2,88 +2,120 @@
 #include <sys/kernel.h>
 #include <sys/module.h>
 #include <sys/socket.h>
-#include <sys/mbuf.h>
-#include <sys/errno.h>
-#include <sys/systm.h>
-#include <sys/types.h>     /* uintptr_t */
-
-#include <net/if.h>
-#include <net/if_var.h>    /* if_xname */
-#include <net/pfil.h>
-
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <net/pfil.h>
+#include <sys/systm.h>
+#include <sys/mbuf.h>
+#include <net/if.h>
+#include <net/ethernet.h>
 
-/* ---- Compatibility shims ---- */
-#ifndef PFIL_IN
-#define PFIL_IN 0x0001
-#endif
+static unsigned long dropped_packets = 0;
+static unsigned long dropped_bytes = 0;
 
-/* Choose an available pa_type at compile time */
-#if defined(PFIL_TYPE_AF)
-#  define BLOCKHTTP_PFIL_TYPE PFIL_TYPE_AF
-#elif defined(PFIL_TYPE_IFNET)
-#  define BLOCKHTTP_PFIL_TYPE PFIL_TYPE_IFNET
-#else
-/* Fallback: some trees accept 0 for pa_type */
-#  define BLOCKHTTP_PFIL_TYPE 0
-#endif
-
-/* Convert pfil_packet_t to struct mbuf* safely across typedef variants */
-#ifndef PKT_TO_MBUF
-#  define PKT_TO_MBUF(p) ((struct mbuf *)(uintptr_t)(p))
-#endif
-/* ----------------------------- */
-
-static pfil_hook_t pfh_in = NULL;
+static pfil_hook_t pfh_inet_hook = NULL;
 
 /* Hook function */
-static pfil_return_t
-block_http_func(pfil_packet_t pkt, struct ifnet *ifp, int dir, void *ctx, struct inpcb *inp)
+static int
+pf_http_filter(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, void *ulp)
 {
-    struct mbuf *m = PKT_TO_MBUF(pkt);   /* works whether pfil_packet_t is ptr or int */
-    if (m == NULL)
-        return 0;
+    struct mbuf *m = *mp;
+    struct ip *ip_hdr;
+    struct tcphdr *tcp_hdr;
+    char *payload;
+    int ip_hlen, tcp_hlen, payload_len;
+    char buf[128];
+    int tocopy;
 
-    if (dir & PFIL_IN) {
-        /* ifp may be opaque in some configs; if_xname is fine with <net/if_var.h> */
-        printf("BlockHTTP(minimal): packet seen on %s\n", ifp ? ifp->if_xname : "(null-ifp)");
+    if (m == NULL) 
+        return (PF_PASS);
+
+    /* Check if it's an IP packet */
+    if (mtod(m, struct ether_header *)->ether_type != htons(ETHERTYPE_IP))
+        return (PF_PASS);
+
+    ip_hdr = mtod(m, struct ip *);
+    
+    /* Check if it's TCP */
+    if (ip_hdr->ip_p != IPPROTO_TCP) 
+        return (PF_PASS);
+
+    ip_hlen = ip_hdr->ip_hl << 2;
+    
+    /* Ensure we have enough data for TCP header */
+    if (m->m_len < ip_hlen + sizeof(struct tcphdr)) {
+        m = m_pullup(m, ip_hlen + sizeof(struct tcphdr));
+        if (m == NULL)
+            return (PF_PASS);
+        *mp = m;
+        ip_hdr = mtod(m, struct ip *);
     }
-    return 0; /* always allow */
+
+    tcp_hdr = (struct tcphdr *)((caddr_t)ip_hdr + ip_hlen);
+    
+    /* Check if it's HTTP (port 80) */
+    if (ntohs(tcp_hdr->th_dport) != 80)
+        return (PF_PASS);
+
+    tcp_hlen = tcp_hdr->th_off << 2;
+    payload_len = ntohs(ip_hdr->ip_len) - (ip_hlen + tcp_hlen);
+    
+    if (payload_len <= 0)
+        return (PF_PASS);
+
+    /* Copy payload for inspection */
+    tocopy = min(sizeof(buf) - 1, payload_len);
+    m_copydata(m, ip_hlen + tcp_hlen, tocopy, buf);
+    buf[tocopy] = '\0';
+
+    /* Check for blocked.com in Host header */
+    if (strstr(buf, "Host: blocked.com") != NULL ||
+        strstr(buf, "Host: blocked.com\r\n") != NULL) {
+        dropped_packets++;
+        dropped_bytes += m->m_pkthdr.len;
+        printf("[pf_blockedcom] Dropped HTTP packet to blocked.com (count=%lu, bytes=%lu)\n",
+               dropped_packets, dropped_bytes);
+        m_freem(m);
+        *mp = NULL;
+        return (PF_DROP);
+    }
+
+    return (PF_PASS);
 }
 
 static int
-load(struct module *m, int cmd, void *arg)
+load(module_t mod, int cmd, void *arg)
 {
     int error = 0;
-    switch (cmd) {
-    case MOD_LOAD: {
-        struct pfil_hook_args pha;
-        memset(&pha, 0, sizeof(pha));
-        pha.pa_version = PFIL_VERSION;
-        pha.pa_flags   = PFIL_IN;
-        pha.pa_type    = BLOCKHTTP_PFIL_TYPE;
-        pha.pa_func    = block_http_func;
-        pha.pa_ruleset = NULL;
-        pha.pa_modname = "block_http";
-        pha.pa_rulname = "blockhttp";
+    struct pfil_hook_args pha;
 
-        pfh_in = pfil_add_hook(&pha);
-        if (pfh_in == NULL) {
-            printf("BlockHTTP(minimal): failed to register hook (pa_type=%d)\n", (int)BLOCKHTTP_PFIL_TYPE);
-            return ENOMEM;
+    switch (cmd) {
+    case MOD_LOAD:
+        memset(&pha, 0, sizeof(pha));
+        pha.pha_func = pf_http_filter;
+        pha.pha_flags = PFIL_IN | PFIL_WAITOK;
+        pha.pha_name = "pf_blockedcom";
+        pha.pha_type = PFIL_TYPE_AF;
+        pha.pha_af = AF_INET;
+        
+        pfh_inet_hook = pfil_add_hook(&pha);
+        if (pfh_inet_hook == NULL) {
+            printf("[pf_blockedcom] Failed to add hook\n");
+            return (ENOMEM);
         }
-        printf("BlockHTTP(minimal): module loaded (PFIL_VERSION=%d, pa_type=%d)\n",
-               (int)PFIL_VERSION, (int)BLOCKHTTP_PFIL_TYPE);
+
+        printf("[pf_blockedcom] Module loaded\n");
         break;
-    }
+
     case MOD_UNLOAD:
-        if (pfh_in != NULL) {
-            pfil_remove_hook(pfh_in);
-            pfh_in = NULL;
-        }
-        printf("BlockHTTP(minimal): module unloaded.\n");
+        if (pfh_inet_hook != NULL)
+            pfil_remove_hook(pfh_inet_hook);
+        
+        printf("[pf_blockedcom] Module unloaded. Total dropped: %lu packets, %lu bytes\n",
+               dropped_packets, dropped_bytes);
         break;
+
     default:
         error = EOPNOTSUPP;
         break;
@@ -91,10 +123,10 @@ load(struct module *m, int cmd, void *arg)
     return error;
 }
 
-static moduledata_t block_http_mod = {
-    "block_http",
+static moduledata_t pf_blockedcom_mod = {
+    "pf_blockedcom",
     load,
     NULL
 };
 
-DECLARE_MODULE(block_http, block_http_mod, SI_SUB_DRIVERS, SI_ORDER_MIDDLE);
+DECLARE_MODULE(pf_blockedcom, pf_blockedcom_mod, SI_SUB_DRIVERS, SI_ORDER_MIDDLE);
