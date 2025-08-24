@@ -1,3 +1,8 @@
+/* block_http.c
+ * FreeBSD pfil hook: drop inbound HTTP requests with Host: blocked.com
+ * Compatible with pfil_hook_args fields: pa_version, pa_type, pa_flags, pa_mbuf_chk, pa_ruleset
+ */
+
 #include <sys/param.h>
 #include <sys/kernel.h>
 #include <sys/module.h>
@@ -19,8 +24,8 @@
 static volatile u_long dropped_pkts = 0;
 static volatile u_long dropped_bytes = 0;
 
-/* Simple kernel-safe memmem */
-static void *
+/* FIX #1: return type is now const void * to avoid dropping const. */
+static const void *
 k_memmem(const void *h, size_t hlen, const void *n, size_t nlen)
 {
     const unsigned char *hay = (const unsigned char *)h;
@@ -31,11 +36,12 @@ k_memmem(const void *h, size_t hlen, const void *n, size_t nlen)
 
     for (size_t i = 0; i + nlen <= hlen; i++) {
         if (hay[i] == nee[0] && bcmp(hay + i, nee, nlen) == 0)
-            return (void *)(hay + i);
+            return (const void *)(hay + i);  /* const-safe */
     }
     return NULL;
 }
 
+/* Ensure we can safely access headers within the mbuf. */
 static int
 pullup_headers(struct mbuf **mp, int len_needed)
 {
@@ -48,8 +54,10 @@ pullup_headers(struct mbuf **mp, int len_needed)
     return (0);
 }
 
+/* FIX #2: signature reordered to match pfil_mbuf_chk_t:
+   pfil_return_t (*)(struct mbuf **, struct ifnet *, int, void *, struct inpcb *) */
 static pfil_return_t
-block_http(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb *inp)
+block_http(struct mbuf **mp, struct ifnet *ifp, int dir, void *arg, struct inpcb *inp)
 {
     struct mbuf *m = *mp;
     struct ip *ip;
@@ -58,6 +66,7 @@ block_http(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb
     int tot_len, l4_off, payload_len;
     unsigned char *payload;
 
+    /* Only inspect inbound IPv4 packets */
     if (dir != PFIL_IN || m == NULL)
         return (PFIL_PASS);
 
@@ -76,6 +85,7 @@ block_http(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb
     if (tot_len < ip_hlen + (int)sizeof(struct tcphdr))
         return (PFIL_PASS);
 
+    /* Ensure entire TCP header is contiguous */
     if (pullup_headers(mp, ip_hlen + (int)sizeof(struct tcphdr)) != 0)
         return (PFIL_PASS);
     m = *mp;
@@ -83,11 +93,13 @@ block_http(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb
     th = (struct tcphdr *)((caddr_t)ip + ip_hlen);
     tcp_hlen = th->th_off << 2;
 
+    /* Sanity */
     if (tcp_hlen < (int)sizeof(struct tcphdr))
         return (PFIL_PASS);
     if (tot_len < ip_hlen + tcp_hlen)
         return (PFIL_PASS);
 
+    /* We only care about HTTP requests (dst port 80) */
     if (ntohs(th->th_dport) != 80)
         return (PFIL_PASS);
 
@@ -96,6 +108,7 @@ block_http(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb
     if (payload_len <= 0)
         return (PFIL_PASS);
 
+    /* Make sure the start of payload is accessible */
     if (pullup_headers(mp, l4_off) != 0)
         return (PFIL_PASS);
     m = *mp;
@@ -103,6 +116,7 @@ block_http(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb
     th = (struct tcphdr *)((caddr_t)ip + ip_hlen);
     payload = (unsigned char *)((caddr_t)th + tcp_hlen);
 
+    /* Pull up up to 2KB of payload to scan headers */
     int scan_len = payload_len > 2048 ? 2048 : payload_len;
     if (m_length(m, NULL) < l4_off + scan_len) {
         if (pullup_headers(mp, l4_off + scan_len) != 0)
@@ -130,7 +144,7 @@ static struct pfil_hook_args pha = {
     .pa_version  = PFIL_VERSION,
     .pa_type     = PFIL_TYPE_IP4,
     .pa_flags    = PFIL_IN,
-    .pa_mbuf_chk = block_http,    /* <-- correct callback field */
+    .pa_mbuf_chk = block_http,     /* correct callback slot */
     .pa_mem_chk  = NULL,
     .pa_ruleset  = NULL,
     .pa_modname  = "block_http",
