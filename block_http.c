@@ -7,6 +7,7 @@
 #include <sys/systm.h>
 
 #include <net/if.h>
+#include <net/if_var.h>   /* Needed for if_xname */
 #include <net/pfil.h>
 
 #include <netinet/in.h>
@@ -18,7 +19,7 @@ static pfil_hook_t pfh_in = NULL;
 static pfil_return_t
 block_http_func(pfil_packet_t pkt, struct ifnet *ifp, int dir, void *ctx, struct inpcb *inp)
 {
-    struct mbuf *m = (struct mbuf *)pkt;
+    struct mbuf *m = pkt;   /* FIXED */
     if (m == NULL)
         return (0);
 
@@ -26,7 +27,7 @@ block_http_func(pfil_packet_t pkt, struct ifnet *ifp, int dir, void *ctx, struct
         printf("BlockHTTP(minimal): packet seen on %s\n", ifp->if_xname);
     }
 
-    return (0);  /* always allow */
+    return (0);  /* allow */
 }
 
 static int
@@ -39,7 +40,7 @@ load(struct module *m, int cmd, void *arg)
         memset(&pha, 0, sizeof(pha));
         pha.pa_version = PFIL_VERSION;
         pha.pa_flags   = PFIL_IN;
-        pha.pa_type    = PFIL_TYPE_IFNET;   /* inbound interface hook */
+        pha.pa_type    = PFIL_TYPE_AF;   /* FIXED */
         pha.pa_func    = block_http_func;
         pha.pa_ruleset = NULL;
         pha.pa_modname = "block_http";
