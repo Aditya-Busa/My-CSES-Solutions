@@ -4,8 +4,6 @@
 #include <sys/socket.h>
 #include <sys/mbuf.h>
 #include <sys/errno.h>
-#include <sys/malloc.h>
-#include <sys/counter.h>
 #include <sys/systm.h>
 
 #include <net/if.h>
@@ -13,112 +11,22 @@
 
 #include <netinet/in.h>
 #include <netinet/ip.h>
-#include <netinet/tcp.h>
 
-#define HTTP_PORT   80
-#define SCAN_BYTES  2048
-#define NEEDLE1     "Host: blocked.com"
-#define NEEDLE2     "host: blocked.com"
-
-MALLOC_DEFINE(M_BLOCKHTTP, "block_http", "BlockHTTP temp buffers");
-
-static counter_u64_t drop_count;
-static counter_u64_t drop_bytes;
 static pfil_hook_t pfh_in = NULL;
-
-static __inline bool
-memfind(const char *hay, int hlen, const char *needle, int nlen)
-{
-    if (nlen <= 0 || hlen < nlen) return false;
-    for (int i = 0; i <= hlen - nlen; i++) {
-        if (bcmp(hay + i, needle, nlen) == 0)
-            return true;
-    }
-    return false;
-}
 
 /* Hook function */
 static pfil_return_t
 block_http_func(pfil_packet_t pkt, struct ifnet *ifp, int dir, void *ctx, struct inpcb *inp)
 {
-    struct mbuf *m = (struct mbuf *)pkt;   /* FIXED: pfil_packet_t is mbuf* */
+    struct mbuf *m = (struct mbuf *)pkt;
     if (m == NULL)
         return (0);
 
-    if (!(dir & PFIL_IN))
-        return (0);
-
-    if (m->m_len < (int)sizeof(struct ip)) {
-        m = m_pullup(m, sizeof(struct ip));
-        if (m == NULL) return (0);
-    }
-    struct ip *ip = mtod(m, struct ip *);
-    if (ip->ip_v != IPVERSION || ip->ip_p != IPPROTO_TCP)
-        return (0);
-
-    if (ntohs(ip->ip_off) & (IP_MF | IP_OFFMASK))
-        return (0);
-
-    int ip_hl = ip->ip_hl << 2;
-    if (ip_hl < (int)sizeof(struct ip))
-        return (0);
-
-    if (m->m_len < ip_hl + (int)sizeof(struct tcphdr)) {
-        m = m_pullup(m, ip_hl + (int)sizeof(struct tcphdr));
-        if (m == NULL) return (0);
-        ip = mtod(m, struct ip *);
-    }
-    struct tcphdr *th = (struct tcphdr *)((caddr_t)ip + ip_hl);
-
-    if (ntohs(th->th_dport) != HTTP_PORT)
-        return (0);
-
-    int tcp_hl = th->th_off << 2;
-    if (tcp_hl < (int)sizeof(struct tcphdr))
-        return (0);
-
-    if (m->m_len < ip_hl + tcp_hl) {
-        m = m_pullup(m, ip_hl + tcp_hl);
-        if (m == NULL) return (0);
-        ip = mtod(m, struct ip *);
-        th = (struct tcphdr *)((caddr_t)ip + ip_hl);
+    if (dir & PFIL_IN) {
+        printf("BlockHTTP(minimal): packet seen on %s\n", ifp->if_xname);
     }
 
-    int total_len  = ntohs(ip->ip_len);
-    int payload_of = ip_hl + tcp_hl;
-    int payload_len = total_len - payload_of;
-    if (payload_len <= 0)
-        return (0);
-
-    int to_copy = payload_len < SCAN_BYTES ? payload_len : SCAN_BYTES;
-    char *buf = (char *)malloc(to_copy, M_BLOCKHTTP, M_NOWAIT);
-    if (buf == NULL)
-        return (0);
-
-    m_copydata(m, payload_of, to_copy, buf);
-
-    bool blocked = false;
-    if (memfind(buf, to_copy, NEEDLE1, (int)sizeof(NEEDLE1) - 1) ||
-        memfind(buf, to_copy, NEEDLE2, (int)sizeof(NEEDLE2) - 1)) {
-        blocked = true;
-    }
-
-    if (blocked) {
-        counter_u64_add(drop_count, 1);
-        counter_u64_add(drop_bytes, payload_len);
-
-        printf("BlockHTTP: DROP Host: blocked.com size=%d drops=%ju bytes=%ju\n",
-               payload_len,
-               (uintmax_t)counter_u64_fetch(drop_count),
-               (uintmax_t)counter_u64_fetch(drop_bytes));
-
-        m_freem(m);
-        free(buf, M_BLOCKHTTP);
-        return (EACCES);
-    }
-
-    free(buf, M_BLOCKHTTP);
-    return (0);
+    return (0);  /* always allow */
 }
 
 static int
@@ -131,23 +39,18 @@ load(struct module *m, int cmd, void *arg)
         memset(&pha, 0, sizeof(pha));
         pha.pa_version = PFIL_VERSION;
         pha.pa_flags   = PFIL_IN;
-        pha.pa_type    = PFIL_TYPE_IFNET;   /* FIXED */
+        pha.pa_type    = PFIL_TYPE_IFNET;   /* inbound interface hook */
         pha.pa_func    = block_http_func;
         pha.pa_ruleset = NULL;
         pha.pa_modname = "block_http";
         pha.pa_rulname = "blockhttp";
 
-        drop_count = counter_u64_alloc(M_WAITOK);
-        drop_bytes = counter_u64_alloc(M_WAITOK);
-
         pfh_in = pfil_add_hook(&pha);
         if (pfh_in == NULL) {
-            printf("BlockHTTP: failed to register hook\n");
-            counter_u64_free(drop_count);
-            counter_u64_free(drop_bytes);
+            printf("BlockHTTP(minimal): failed to register hook\n");
             return (ENOMEM);
         }
-        printf("BlockHTTP module loaded.\n");
+        printf("BlockHTTP(minimal): module loaded.\n");
         break;
     }
     case MOD_UNLOAD:
@@ -155,13 +58,8 @@ load(struct module *m, int cmd, void *arg)
             pfil_remove_hook(pfh_in);
             pfh_in = NULL;
         }
-        printf("BlockHTTP unloaded. drops=%ju bytes=%ju\n",
-               (uintmax_t)counter_u64_fetch(drop_count),
-               (uintmax_t)counter_u64_fetch(drop_bytes));
-        counter_u64_free(drop_count);
-        counter_u64_free(drop_bytes);
+        printf("BlockHTTP(minimal): module unloaded.\n");
         break;
-
     default:
         error = EOPNOTSUPP;
         break;
