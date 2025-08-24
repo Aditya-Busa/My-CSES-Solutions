@@ -37,12 +37,11 @@ memfind(const char *hay, int hlen, const char *needle, int nlen)
     return false;
 }
 
+/* Hook function */
 static pfil_return_t
 block_http_func(pfil_packet_t pkt, struct ifnet *ifp, int dir, void *ctx, struct inpcb *inp)
 {
-    struct mbuf **mp = (struct mbuf **)pkt;
-    struct mbuf *m = (mp != NULL) ? *mp : NULL;
-
+    struct mbuf *m = (struct mbuf *)pkt;   /* FIXED: pfil_packet_t is mbuf* */
     if (m == NULL)
         return (0);
 
@@ -51,8 +50,7 @@ block_http_func(pfil_packet_t pkt, struct ifnet *ifp, int dir, void *ctx, struct
 
     if (m->m_len < (int)sizeof(struct ip)) {
         m = m_pullup(m, sizeof(struct ip));
-        if (m == NULL) { if (mp) *mp = NULL; return (0); }
-        if (mp) *mp = m;
+        if (m == NULL) return (0);
     }
     struct ip *ip = mtod(m, struct ip *);
     if (ip->ip_v != IPVERSION || ip->ip_p != IPPROTO_TCP)
@@ -67,8 +65,7 @@ block_http_func(pfil_packet_t pkt, struct ifnet *ifp, int dir, void *ctx, struct
 
     if (m->m_len < ip_hl + (int)sizeof(struct tcphdr)) {
         m = m_pullup(m, ip_hl + (int)sizeof(struct tcphdr));
-        if (m == NULL) { if (mp) *mp = NULL; return (0); }
-        if (mp) *mp = m;
+        if (m == NULL) return (0);
         ip = mtod(m, struct ip *);
     }
     struct tcphdr *th = (struct tcphdr *)((caddr_t)ip + ip_hl);
@@ -82,8 +79,7 @@ block_http_func(pfil_packet_t pkt, struct ifnet *ifp, int dir, void *ctx, struct
 
     if (m->m_len < ip_hl + tcp_hl) {
         m = m_pullup(m, ip_hl + tcp_hl);
-        if (m == NULL) { if (mp) *mp = NULL; return (0); }
-        if (mp) *mp = m;
+        if (m == NULL) return (0);
         ip = mtod(m, struct ip *);
         th = (struct tcphdr *)((caddr_t)ip + ip_hl);
     }
@@ -117,7 +113,6 @@ block_http_func(pfil_packet_t pkt, struct ifnet *ifp, int dir, void *ctx, struct
                (uintmax_t)counter_u64_fetch(drop_bytes));
 
         m_freem(m);
-        if (mp) *mp = NULL;
         free(buf, M_BLOCKHTTP);
         return (EACCES);
     }
@@ -136,7 +131,7 @@ load(struct module *m, int cmd, void *arg)
         memset(&pha, 0, sizeof(pha));
         pha.pa_version = PFIL_VERSION;
         pha.pa_flags   = PFIL_IN;
-        pha.pa_type    = PFIL_TYPE_AF;
+        pha.pa_type    = PFIL_TYPE_IFNET;   /* FIXED */
         pha.pa_func    = block_http_func;
         pha.pa_ruleset = NULL;
         pha.pa_modname = "block_http";
