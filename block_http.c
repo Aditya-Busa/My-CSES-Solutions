@@ -1,4 +1,4 @@
-/* block_http.c — FreeBSD 13.4 pfil (pa_func variant) */
+/* block_http.c — FreeBSD 13.4 pfil (pa_func variant, fixed to use pa_ruleset) */
 
 #include <sys/param.h>
 #include <sys/kernel.h>
@@ -128,13 +128,15 @@ block_http(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb
 }
 
 static struct pfil_hook *hook;
+/* pfil_head pointer we will attach to — stored so we can clear pa_ruleset on unload */
+static struct pfil_head *pfil_head_ipv4;
 
 static struct pfil_hook_args pha = {
     .pa_version = PFIL_VERSION,
     .pa_flags   = PFIL_IN,
     .pa_type    = PFIL_TYPE_IP4,
-    .pa_func    = (pfil_func_t) block_http,      /* >>> use pa_func on 13.4 <<< */
-    .pa_ruleset = NULL,
+    .pa_func    = (pfil_func_t) block_http,      /* use pa_func on 13.4 */
+    /* .pa_ruleset will be set at load time to the pfil_head pointer */
     .pa_modname = "block_http",
     .pa_rulname = "drop_blocked_host",
 };
@@ -142,26 +144,47 @@ static struct pfil_hook_args pha = {
 static int
 mod_handler(module_t mod, int what, void *arg)
 {
+    int error = 0;
+
     switch (what) {
     case MOD_LOAD:
+        /* get the default IPv4 pfil head and put it into pa_ruleset */
+        pfil_head_ipv4 = pfil_head_get(PFIL_TYPE_IP4, 0);
+        if (pfil_head_ipv4 == NULL) {
+            printf("block_http: no IPv4 pfil head found\n");
+            return (ENOENT);
+        }
+
+        pha.pa_ruleset = (void *)pfil_head_ipv4;
+
         hook = pfil_add_hook(&pha);
         if (hook == NULL) {
             printf("block_http: failed to add hook\n");
+            /* clear pa_ruleset for cleanliness */
+            pha.pa_ruleset = NULL;
             return (ENOMEM);
         }
         dropped_pkts = dropped_bytes = 0;
         printf("block_http: module loaded (tracking Host: blocked.com)\n");
         break;
+
     case MOD_UNLOAD:
-        if (hook != NULL)
+        if (hook != NULL) {
             pfil_remove_hook(hook);
+            hook = NULL;
+        }
+        /* clear pa_ruleset pointer (not strictly required) */
+        pha.pa_ruleset = NULL;
+        pfil_head_ipv4 = NULL;
+
         printf("block_http: module unloaded (drops=%lu, bytes=%lu)\n",
                dropped_pkts, dropped_bytes);
         break;
+
     default:
         return (EOPNOTSUPP);
     }
-    return (0);
+    return (error);
 }
 
 static moduledata_t block_http_mod = {
@@ -172,3 +195,4 @@ static moduledata_t block_http_mod = {
 
 DECLARE_MODULE(block_http, block_http_mod, SI_SUB_DRIVERS, SI_ORDER_MIDDLE);
 MODULE_VERSION(block_http, 1);
+
