@@ -1,4 +1,4 @@
-/* block_http.c — FreeBSD 13.4 pfil (pa_func variant, fixed to use pa_ruleset) */
+/* Simple block_http.c for FreeBSD 13.4 */
 
 #include <sys/param.h>
 #include <sys/kernel.h>
@@ -8,191 +8,147 @@
 #include <sys/socket.h>
 
 #include <net/if.h>
+#include <net/pfil.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
-#include <netinet/in_pcb.h>
-
-#include <net/pfil.h>
-
-#define TARGET_HOST "Host: blocked.com"
-#define TARGET_HOST_LEN (sizeof(TARGET_HOST) - 1)
 
 static volatile u_long dropped_pkts = 0;
 static volatile u_long dropped_bytes = 0;
 
-/* const-safe memmem */
-static const void *
-k_memmem(const void *h, size_t hlen, const void *n, size_t nlen)
-{
-    const unsigned char *hay = (const unsigned char *)h;
-    const unsigned char *nee = (const unsigned char *)n;
-
-    if (nlen == 0 || hlen < nlen)
-        return NULL;
-
-    for (size_t i = 0; i + nlen <= hlen; i++) {
-        if (hay[i] == nee[0] && bcmp(hay + i, nee, nlen) == 0)
-            return (const void *)(hay + i);
-    }
-    return NULL;
-}
-
-static int
-pullup_headers(struct mbuf **mp, int len_needed)
-{
-    if (m_length(*mp, NULL) < len_needed) {
-        struct mbuf *m2 = m_pullup(*mp, len_needed);
-        if (m2 == NULL)
-            return (ENOMEM);
-        *mp = m2;
-    }
-    return (0);
-}
-
-/* >>> FIXED back to pfil_func_t order <<< */
 static pfil_return_t
-block_http(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb *inp)
+simple_block_hook(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb *inp)
 {
-    struct mbuf *m = *mp;
+    struct mbuf *m;
     struct ip *ip;
     struct tcphdr *th;
-    int ip_hlen, tcp_hlen;
-    int tot_len, l4_off, payload_len;
-    unsigned char *payload;
+    char *data;
+    int ip_len, tcp_len, data_len;
 
-    if (dir != PFIL_IN || m == NULL)
+    printf("simple_block_hook: packet received, dir=%d\n", dir);
+
+    if (dir != PFIL_IN)
         return (PFIL_PASS);
 
-    if (m->m_len < (int)sizeof(struct ip)) {
-        if (pullup_headers(mp, sizeof(struct ip)) != 0)
+    m = *mp;
+    if (m == NULL)
+        return (PFIL_PASS);
+
+    /* Basic IP header check */
+    if (m->m_len < sizeof(struct ip)) {
+        m = m_pullup(m, sizeof(struct ip));
+        if (m == NULL)
             return (PFIL_PASS);
-        m = *mp;
+        *mp = m;
     }
 
     ip = mtod(m, struct ip *);
     if (ip->ip_v != 4 || ip->ip_p != IPPROTO_TCP)
         return (PFIL_PASS);
 
-    ip_hlen = ip->ip_hl << 2;
-    tot_len = ntohs(ip->ip_len);
-    if (tot_len < ip_hlen + (int)sizeof(struct tcphdr))
-        return (PFIL_PASS);
+    printf("simple_block_hook: TCP packet found\n");
 
-    if (pullup_headers(mp, ip_hlen + (int)sizeof(struct tcphdr)) != 0)
-        return (PFIL_PASS);
-    m = *mp;
-    ip = mtod(m, struct ip *);
-    th = (struct tcphdr *)((caddr_t)ip + ip_hlen);
-    tcp_hlen = th->th_off << 2;
+    ip_len = ip->ip_hl << 2;
+    
+    /* Get TCP header */
+    if (m->m_len < ip_len + sizeof(struct tcphdr)) {
+        m = m_pullup(m, ip_len + sizeof(struct tcphdr));
+        if (m == NULL)
+            return (PFIL_PASS);
+        *mp = m;
+        ip = mtod(m, struct ip *);
+    }
 
-    if (tcp_hlen < (int)sizeof(struct tcphdr))
-        return (PFIL_PASS);
-    if (tot_len < ip_hlen + tcp_hlen)
-        return (PFIL_PASS);
-
+    th = (struct tcphdr *)((char *)ip + ip_len);
+    
+    /* Check if it's HTTP (port 80) */
     if (ntohs(th->th_dport) != 80)
         return (PFIL_PASS);
 
-    l4_off = ip_hlen + tcp_hlen;
-    payload_len = tot_len - l4_off;
-    if (payload_len <= 0)
+    printf("simple_block_hook: HTTP packet to port 80\n");
+
+    tcp_len = th->th_off << 2;
+    data_len = ntohs(ip->ip_len) - ip_len - tcp_len;
+
+    if (data_len <= 0)
         return (PFIL_PASS);
 
-    if (pullup_headers(mp, l4_off) != 0)
-        return (PFIL_PASS);
-    m = *mp;
-    ip = mtod(m, struct ip *);
-    th = (struct tcphdr *)((caddr_t)ip + ip_hlen);
-    payload = (unsigned char *)((caddr_t)th + tcp_hlen);
+    printf("simple_block_hook: HTTP packet has %d bytes payload\n", data_len);
 
-    int scan_len = payload_len > 2048 ? 2048 : payload_len;
-    if (m_length(m, NULL) < l4_off + scan_len) {
-        if (pullup_headers(mp, l4_off + scan_len) != 0)
+    /* Try to get some payload data */
+    int needed = ip_len + tcp_len + 100; /* Just get first 100 bytes of payload */
+    if (needed > ntohs(ip->ip_len))
+        needed = ntohs(ip->ip_len);
+
+    if (m->m_len < needed) {
+        m = m_pullup(m, needed);
+        if (m == NULL)
             return (PFIL_PASS);
-        m = *mp;
+        *mp = m;
         ip = mtod(m, struct ip *);
-        th = (struct tcphdr *)((caddr_t)ip + ip_hlen);
-        payload = (unsigned char *)((caddr_t)th + tcp_hlen);
+        th = (struct tcphdr *)((char *)ip + ip_len);
     }
 
-    if (k_memmem(payload, scan_len, TARGET_HOST, TARGET_HOST_LEN) != NULL) {
-        dropped_pkts++;
-        dropped_bytes += payload_len;
-        printf("block_http: dropped HTTP packet for blocked.com; payload=%d bytes (drops=%lu, bytes=%lu)\n",
-               payload_len, dropped_pkts, dropped_bytes);
-        return (PFIL_DROPPED);
+    data = (char *)th + tcp_len;
+    int search_len = (needed - ip_len - tcp_len) < data_len ? (needed - ip_len - tcp_len) : data_len;
+
+    /* Simple string search for blocked.com */
+    if (search_len > 10) {
+        for (int i = 0; i < search_len - 10; i++) {
+            if (strncmp(data + i, "blocked.com", 11) == 0) {
+                dropped_pkts++;
+                dropped_bytes += ntohs(ip->ip_len);  /* Total packet size */
+                printf("simple_block: DROPPED packet #%lu for blocked.com - packet size: %d bytes, total dropped: %lu packets, %lu bytes\n",
+                       dropped_pkts, ntohs(ip->ip_len), dropped_pkts, dropped_bytes);
+                return (PFIL_DROPPED);
+            }
+        }
     }
 
+    printf("simple_block_hook: HTTP request allowed\n");
     return (PFIL_PASS);
 }
-
-static struct pfil_hook *hook;
-/* pfil_head pointer we will attach to — stored so we can clear pa_ruleset on unload */
-static struct pfil_head *pfil_head_ipv4;
 
 static struct pfil_hook_args pha = {
     .pa_version = PFIL_VERSION,
     .pa_flags   = PFIL_IN,
     .pa_type    = PFIL_TYPE_IP4,
-    .pa_func    = (pfil_func_t) block_http,      /* use pa_func on 13.4 */
-    /* .pa_ruleset will be set at load time to the pfil_head pointer */
-    .pa_modname = "block_http",
-    .pa_rulname = "drop_blocked_host",
+    .pa_func    = simple_block_hook,
+    .pa_modname = "simple_block",
+    .pa_rulname = "block_rule",
 };
 
-static int
-mod_handler(module_t mod, int what, void *arg)
-{
-    int error = 0;
+static pfil_hook_t hook;
 
+static int
+simple_block_handler(module_t mod, int what, void *arg)
+{
     switch (what) {
     case MOD_LOAD:
-        /* get the default IPv4 pfil head and put it into pa_ruleset */
-        pfil_head_ipv4 = pfil_head_get(PFIL_TYPE_IP4, 0);
-        if (pfil_head_ipv4 == NULL) {
-            printf("block_http: no IPv4 pfil head found\n");
-            return (ENOENT);
-        }
-
-        pha.pa_ruleset = (void *)pfil_head_ipv4;
-
+        printf("simple_block: Loading...\n");
         hook = pfil_add_hook(&pha);
         if (hook == NULL) {
-            printf("block_http: failed to add hook\n");
-            /* clear pa_ruleset for cleanliness */
-            pha.pa_ruleset = NULL;
+            printf("simple_block: Failed to add hook!\n");
             return (ENOMEM);
         }
-        dropped_pkts = dropped_bytes = 0;
-        printf("block_http: module loaded (tracking Host: blocked.com)\n");
+        printf("simple_block: Loaded successfully!\n");
         break;
-
     case MOD_UNLOAD:
-        if (hook != NULL) {
+        if (hook)
             pfil_remove_hook(hook);
-            hook = NULL;
-        }
-        /* clear pa_ruleset pointer (not strictly required) */
-        pha.pa_ruleset = NULL;
-        pfil_head_ipv4 = NULL;
-
-        printf("block_http: module unloaded (drops=%lu, bytes=%lu)\n",
-               dropped_pkts, dropped_bytes);
+        printf("simple_block: Unloaded (drops=%lu)\n", dropped_pkts);
         break;
-
     default:
         return (EOPNOTSUPP);
     }
-    return (error);
+    return (0);
 }
 
-static moduledata_t block_http_mod = {
-    "block_http",
-    mod_handler,
+static moduledata_t simple_block_mod = {
+    "simple_block",
+    simple_block_handler,
     NULL
 };
 
-DECLARE_MODULE(block_http, block_http_mod, SI_SUB_DRIVERS, SI_ORDER_MIDDLE);
-MODULE_VERSION(block_http, 1);
-
+DECLARE_MODULE(simple_block, simple_block_mod, SI_SUB_DRIVERS, SI_ORDER_MIDDLE);
+MODULE_VERSION(simple_block, 1);
