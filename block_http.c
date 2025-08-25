@@ -17,9 +17,9 @@ static volatile u_long dropped_pkts = 0;
 static volatile u_long dropped_bytes = 0;
 
 static pfil_return_t
-simple_block_hook(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb *inp)
+simple_block_hook(pfil_packet_t *packet, struct ifnet *ifp, int dir, void *arg, struct inpcb *inp)
 {
-    struct mbuf *m;
+    struct mbuf *m, **mp;
     struct ip *ip;
     struct tcphdr *th;
     char *data;
@@ -30,9 +30,10 @@ simple_block_hook(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struc
     if (dir != PFIL_IN)
         return (PFIL_PASS);
 
-    m = *mp;
-    if (m == NULL)
+    mp = pfil_packet_to_mbuf(packet);
+    if (mp == NULL || *mp == NULL)
         return (PFIL_PASS);
+    m = *mp;
 
     /* Basic IP header check */
     if (m->m_len < sizeof(struct ip)) {
