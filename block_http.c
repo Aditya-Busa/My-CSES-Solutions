@@ -54,9 +54,6 @@ pullup_headers(struct mbuf **mp, int len_needed)
 static pfil_return_t
 block_http(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb *inp)
 {
-
-    printf("Start 1");
-
     struct mbuf *m = *mp;
     struct ip *ip;
     struct tcphdr *th;
@@ -64,89 +61,46 @@ block_http(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb
     int tot_len, l4_off, payload_len;
     unsigned char *payload;
 
-    if (dir != PFIL_IN || m == NULL) {
-        printf("Return 2");
+    if (dir != PFIL_IN || m == NULL)
         return (PFIL_PASS);
-    }
-
-    printf("Continue 2");
 
     if (m->m_len < (int)sizeof(struct ip)) {
-        if (pullup_headers(mp, sizeof(struct ip)) != 0) {
-            printf("Return 3");
+        if (pullup_headers(mp, sizeof(struct ip)) != 0)
             return (PFIL_PASS);
-        }
         m = *mp;
     }
 
-    printf("Continue 3");
-
     ip = mtod(m, struct ip *);
-    if (ip->ip_v != 4 || ip->ip_p != IPPROTO_TCP) {
-        printf("Return 4");
+    if (ip->ip_v != 4 || ip->ip_p != IPPROTO_TCP)
         return (PFIL_PASS);
-    }
-
-    printf("Continue 4");
 
     ip_hlen = ip->ip_hl << 2;
     tot_len = ntohs(ip->ip_len);
-    if (tot_len < ip_hlen + (int)sizeof(struct tcphdr)) {
-        printf("Return 5");
+    if (tot_len < ip_hlen + (int)sizeof(struct tcphdr))
         return (PFIL_PASS);
-    }
 
-    printf("Continue 5");
-
-    if (pullup_headers(mp, ip_hlen + (int)sizeof(struct tcphdr)) != 0) {
-        printf("Return 6");
+    if (pullup_headers(mp, ip_hlen + (int)sizeof(struct tcphdr)) != 0)
         return (PFIL_PASS);
-    }
-
-    printf("Continue 6");
-
     m = *mp;
     ip = mtod(m, struct ip *);
     th = (struct tcphdr *)((caddr_t)ip + ip_hlen);
     tcp_hlen = th->th_off << 2;
 
-    if (tcp_hlen < (int)sizeof(struct tcphdr)) {
-        printf("Return 7");
+    if (tcp_hlen < (int)sizeof(struct tcphdr))
         return (PFIL_PASS);
-    }
-
-    printf("Continue 7");
-
-    if (tot_len < ip_hlen + tcp_hlen) {
-        printf("Return 8");
+    if (tot_len < ip_hlen + tcp_hlen)
         return (PFIL_PASS);
-    }
 
-    printf("Continue 8");
-
-    if (ntohs(th->th_dport) != 80) {
-        printf("Return 9");
+    if (ntohs(th->th_dport) != 80)
         return (PFIL_PASS);
-    }
-
-    printf("Continue 9");
 
     l4_off = ip_hlen + tcp_hlen;
     payload_len = tot_len - l4_off;
-    if (payload_len <= 0) {
-        printf("Return 10");
+    if (payload_len <= 0)
         return (PFIL_PASS);
-    }
 
-    printf("Continue 10");
-
-    if (pullup_headers(mp, l4_off) != 0) {
-        printf("Return 11");
+    if (pullup_headers(mp, l4_off) != 0)
         return (PFIL_PASS);
-    }
-
-    printf("Continue 11");
-
     m = *mp;
     ip = mtod(m, struct ip *);
     th = (struct tcphdr *)((caddr_t)ip + ip_hlen);
@@ -154,12 +108,8 @@ block_http(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb
 
     int scan_len = payload_len > 2048 ? 2048 : payload_len;
     if (m_length(m, NULL) < l4_off + scan_len) {
-        printf("Continue 12");
-        if (pullup_headers(mp, l4_off + scan_len) != 0) {
-            printf("Return 12");
+        if (pullup_headers(mp, l4_off + scan_len) != 0)
             return (PFIL_PASS);
-        }
-        printf("Continue 13");
         m = *mp;
         ip = mtod(m, struct ip *);
         th = (struct tcphdr *)((caddr_t)ip + ip_hlen);
@@ -167,15 +117,12 @@ block_http(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb
     }
 
     if (k_memmem(payload, scan_len, TARGET_HOST, TARGET_HOST_LEN) != NULL) {
-        printf("Continue 14");
         dropped_pkts++;
         dropped_bytes += payload_len;
         printf("block_http: dropped HTTP packet for blocked.com; payload=%d bytes (drops=%lu, bytes=%lu)\n",
                payload_len, dropped_pkts, dropped_bytes);
         return (PFIL_DROPPED);
     }
-
-    printf("Continue 15");
 
     return (PFIL_PASS);
 }
@@ -186,7 +133,7 @@ static struct pfil_hook_args pha = {
     .pa_version = PFIL_VERSION,
     .pa_flags   = PFIL_IN,
     .pa_type    = PFIL_TYPE_IP4,
-    .pa_func    = block_http,      /* >>> use pa_func on 13.4 <<< */
+    .pa_func    = (pfil_func_t) block_http,      /* >>> use pa_func on 13.4 <<< */
     .pa_ruleset = NULL,
     .pa_modname = "block_http",
     .pa_rulname = "drop_blocked_host",
