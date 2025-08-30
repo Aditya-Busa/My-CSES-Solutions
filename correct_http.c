@@ -1,4 +1,4 @@
-/* block_http.c — FreeBSD 13.4 pfil (pa_func variant) - FIXED */
+/* block_http.c — FreeBSD 13.4 pfil (pa_func variant) */
 
 #include <sys/param.h>
 #include <sys/kernel.h>
@@ -50,9 +50,8 @@ pullup_headers(struct mbuf **mp, int len_needed)
     return (0);
 }
 
-
 static pfil_return_t
-block_http(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb *inp)
+block_http(struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb *inp)
 {
     struct mbuf *m = *mp;
     struct ip *ip;
@@ -98,13 +97,13 @@ block_http(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb
     payload_len = tot_len - l4_off;
     if (payload_len <= 0)
         return (PFIL_PASS);
-    
-    // There is no need for this pullup. The next pullup is sufficient.
-    // if (pullup_headers(mp, l4_off) != 0)
-    //     return (PFIL_PASS);
-    // m = *mp;
-    // ip = mtod(m, struct ip *);
-    // th = (struct tcphdr *)((caddr_t)ip + ip_hlen);
+
+    if (pullup_headers(mp, l4_off) != 0)
+        return (PFIL_PASS);
+    m = *mp;
+    ip = mtod(m, struct ip *);
+    th = (struct tcphdr *)((caddr_t)ip + ip_hlen);
+    payload = (unsigned char *)((caddr_t)th + tcp_hlen);
 
     int scan_len = payload_len > 2048 ? 2048 : payload_len;
     if (m_length(m, NULL) < l4_off + scan_len) {
@@ -113,23 +112,16 @@ block_http(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb
         m = *mp;
         ip = mtod(m, struct ip *);
         th = (struct tcphdr *)((caddr_t)ip + ip_hlen);
+        payload = (unsigned char *)((caddr_t)th + tcp_hlen);
     }
-    payload = (unsigned char *)mtod(m, caddr_t) + l4_off;
 
     if (k_memmem(payload, scan_len, TARGET_HOST, TARGET_HOST_LEN) != NULL) {
         dropped_pkts++;
-        dropped_bytes += tot_len; /* Use total packet length for stats */
+        dropped_bytes += tot_len;
         printf("block_http: dropped HTTP packet for blocked.com; payload=%d bytes (drops=%lu, bytes=%lu)\n",
                payload_len, dropped_pkts, dropped_bytes);
-
-        /*
-         * CHANGE 1: Free the mbuf to prevent memory leaks.
-         * When returning PFIL_DROPPED, the filter is responsible for
-         * freeing the packet's memory.
-         */
         m_freem(m);
         *mp = NULL;
-
         return (PFIL_DROPPED);
     }
 
@@ -137,14 +129,13 @@ block_http(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb
 }
 
 static struct pfil_hook *hook;
-/* CHANGE 2: Added a static struct to hold link arguments for linking/unlinking */
 static struct pfil_link_args pla;
 
 static struct pfil_hook_args pha = {
     .pa_version = PFIL_VERSION,
     .pa_flags   = PFIL_IN,
     .pa_type    = PFIL_TYPE_IP4,
-    .pa_func    = (pfil_func_t) block_http,
+    .pa_func    = (pfil_func_t) block_http,   /* >>> use pa_func on 13.4 <<< */
     .pa_ruleset = NULL,
     .pa_modname = "block_http",
     .pa_rulname = "drop_blocked_host",
@@ -161,10 +152,6 @@ mod_handler(module_t mod, int what, void *arg)
             return (ENOMEM);
         }
 
-        /*
-         * CHANGE 3: Link the hook to the 'inet' (IPv4) protocol head.
-         * The hook is registered but not active until it's linked.
-         */
         bzero(&pla, sizeof(pla));
         pla.pa_version = PFIL_VERSION;
         pla.pa_flags = PFIL_IN | PFIL_HOOKPTR;
@@ -181,14 +168,8 @@ mod_handler(module_t mod, int what, void *arg)
         printf("block_http: module loaded (tracking Host: blocked.com)\n");
         break;
     case MOD_UNLOAD:
-        if (hook != NULL) {
-            /*
-             * CHANGE 4: Unlink the hook before removing it. This
-             * gracefully detaches it from packet processing.
-             */
-            pfil_unlink(&pla);
+        if (hook != NULL)
             pfil_remove_hook(hook);
-        }
         printf("block_http: module unloaded (drops=%lu, bytes=%lu)\n",
                dropped_pkts, dropped_bytes);
         break;
